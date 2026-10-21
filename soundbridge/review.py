@@ -1,132 +1,217 @@
-"""Ручное ревью соответствий.
+"""Ручное ревью спорных совпадений прямо в терминале.
 
-Два способа работать:
-  * `out/review.csv` — таблица (см. report.py), удобно в Excel;
-  * интерактивный режим — проходит по самым «дорогим» позициям прямо в терминале.
+CSV (``soundbridge.report``) удобен, когда треков много и хочется разобрать их
+пачкой в таблице. Этот модуль — для «быстро докидать десяток»: показываем трек
+из Яндекса, показываем кандидатов Spotify, жмём цифру / ``s`` / ``m``.
+
+Все решения уходят в те же таблицы (``override`` + ``match``), что и CSV-ревью,
+поэтому два способа можно мешать как угодно.
 """
+
 from __future__ import annotations
 
 import json
-import sqlite3
-from typing import Any
+from typing import Any, Callable, Iterable
 
-from .config import Settings
-from .normalize import display_track
+from .spotify_client import to_uri
 from .storage import Database
 
+HELP = """
+  1..9 — взять кандидата с этим номером
+  s    — трек не переносим (пропустить)
+  m    — вставить spotify-URI / ссылку / id вручную
+  n    — пропустить, вернуться к нему позже (ничего не сохраняем)
+  d    — показать кандидатов ещё раз
+  q    — закончить
+  ?    — эта справка
+""".strip()
 
-def _candidates(row: sqlite3.Row) -> list[dict[str, Any]]:
+#: как часто сбрасывать накопленные решения в базу, чтобы не потерять их при обрыве
+FLUSH_EVERY = 25
+
+
+def _artists_of(raw: Any) -> str:
+    if raw is None:
+        return ""
+    if isinstance(raw, (list, tuple)):
+        return ", ".join(str(a) for a in raw if a)
+    text = str(raw)
     try:
-        return json.loads(row["candidates"] or "[]")
-    except ValueError:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return text
+    if isinstance(data, list):
+        return ", ".join(str(a) for a in data if a)
+    return text
+
+
+def _mmss(ms: Any) -> str:
+    try:
+        total = int(ms or 0) // 1000
+    except (TypeError, ValueError):
+        return ""
+    return f"{total // 60}:{total % 60:02d}" if total > 0 else ""
+
+
+def pending(db: Database) -> list[Any]:
+    """Всё спорное: низкая уверенность или нет результата."""
+    return list(db.list_review())
+
+
+def _show(row: Any, index: int, total: int) -> None:
+    method = row["method"] or "нет решения"
+    score = row["confidence"]
+    print()
+    print(f"─" * 78)
+    print(f"[{index + 1}/{total}] {row['title'] or '(без названия)'}"
+          + (f" [{row['version']}]" if row["version"] else ""))
+    print(f"   {row['ym_id']} · исполнитель: {_artists_of(row['artists']) or '—'}")
+    print(f"   альбом: {row['album'] or '—'} · длительность: {_mmss(row['duration_ms'])}"
+          f" · ISRC: {row['isrc'] or '—'} · в плейлистах: {row['n_refs']}")
+    if method == "no_result":
+        print("   ⚠ Spotify-аналог не найден (или помечен непереносимым)")
+    elif method == "review":
+        print(f"   ⚠ слишком низкая уверенность: {float(score or 0):.2f}")
+    else:
+        print(f"   метод: {method} · уверенность: {float(score or 0):.2f}")
+    if row["note"]:
+        print(f"   заметка матчера: {row['note']}")
+
+    cands = _candidates(row)
+    if not cands:
+        print("   кандидатов нет — вставьте URI сами (m) или пропустите (s)")
+        return
+    print("   кандидаты:")
+    for i, cand in enumerate(cands[:9], start=1):
+        mark = "→" if cand.get("uri") == row["uri"] else " "
+        print(f"   {mark} {i}. {cand.get('name') or cand.get('title') or '(без имени)'}"
+              f" — {_artists_of(cand.get('artists')) or '—'}")
+        print(f"        {cand.get('uri')} · {cand.get('album') or '—'} · "
+              f"{_mmss(cand.get('duration_ms'))} · "
+              f"оценка {float(cand.get('score') or cand.get('confidence') or 0):.2f}"
+              f" · {cand.get('method') or cand.get('how') or '?'}")
+
+
+def _candidates(row: Any) -> list[dict[str, Any]]:
+    raw = row["candidates"] if "candidates" in row.keys() else None
+    if not raw:
         return []
-
-
-def show(settings: Settings, limit: int = 25) -> dict[str, Any]:
-    """Печатает список того, что требует решения."""
-    db = Database(settings.db_path)
     try:
-        counts = db.review_counts()
-        rows = db.list_review()
-        print("— Требует решения —")
-        print(f"  не найдено: {counts['no_result']}, сомнительно: {counts['review']}, "
-              f"нечёткие: {counts['fuzzy']}, без матчинга: {counts['none']}, "
-              f"всего: {counts['total']}")
-        if not rows:
-            print("  пусто — можно запускать import")
-        for i, row in enumerate(rows[:limit], start=1):
-            print(f"\n{i}. {display_track(row['artists'], row['title'], row['version'])}"
-                  f" [{row['ym_id']}] · используется в {row['n_refs']} местах")
-            print(f"   Яндекс: {row['album'] or '—'} · {row['duration_ms'] or 0} мс"
-                  f" · ISRC {row['isrc'] or 'нет'}")
-            if row["uri"]:
-                print(f"   сейчас стоит: {row['sp_artists']} — {row['sp_name']}"
-                      f" ({row['method']}, {round(float(row['confidence'] or 0), 2)})")
-                print(f"     {row['uri']}")
-            else:
-                print("   сейчас стоит: (пусто)")
-            for j, cand in enumerate(_candidates(row)[:3], start=1):
-                mark = ""
-                if cand.get("duration_ms") and row["duration_ms"]:
-                    delta = abs(int(cand["duration_ms"]) - int(row["duration_ms"]))
-                    mark = f" · Δ{delta / 1000:.1f} c"
-                print(f"   {j}) {cand.get('score', 0):.2f} {cand.get('artists')} — "
-                      f"{cand.get('title')} [{cand.get('album')}] {cand.get('duration_ms')}мс{mark}")
-                print(f"      {cand.get('uri')}")
-        if len(rows) > limit:
-            print(f"\n…и ещё {len(rows) - limit}. Полный список: out/review.csv")
-        print("\nРешение: `python -m soundbridge review --set <ym_id> <spotify_uri>` "
-              "или заполни колонку decision_uri в out/review.csv и `review --apply`.")
-        return {"total": counts["total"], "shown": min(limit, len(rows))}
-    finally:
-        db.close()
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if isinstance(data, dict):
+        data = data.get("candidates") or []
+    return [c for c in data if isinstance(c, dict)]
 
 
-def set_decision(settings: Settings, ym_id: str, uri: str, note: str = "") -> None:
-    db = Database(settings.db_path)
-    try:
-        if uri and not uri.startswith("spotify:track:"):
-            track = db.track_of_uri(uri)
-            if not track:
-                raise SystemExit(
-                    f"Spotify-трек {uri} не найден в базе. Возьми URI из списка кандидатов "
-                    "или из ссылки на трек."
-                )
-        db.set_override(ym_id, uri, note)
-        if uri:
-            db.save_match(ym_id, uri, 1.0, "override", note=note or "решение пользователя")
-        else:
-            db.save_match(ym_id, None, 0.0, "no_result", note=note or "решение пользователя: не переносим")
-        db.commit()
-        action = f"{ym_id} → {uri}" if uri else f"{ym_id} → пропуск"
-        print(f"Записано: {action}")
-        print("Обнови матчинг (дешёвая операция, сети не трогает): python -m soundbridge match")
-    finally:
-        db.close()
+def apply(db: Database, decisions: Iterable[tuple[str, str]]) -> dict[str, Any]:
+    """Один общий вход для CLI и интерактивного режима: ``(ym_id, uri)``."""
+    pairs = [(ym, (uri or "").strip()) for ym, uri in decisions]
+    pairs = [(ym, to_uri(uri)) if uri else (ym, "") for ym, uri in pairs if ym]
+    if not pairs:
+        return {"applied": 0, "cleared": 0, "missing": 0, "missing_detail": []}
+    result = db.apply_overrides(pairs)
+    db.log_event("review", f"ручных решений принято: {len(pairs)}")
+    return {
+        "applied": len(result["applied"]),
+        "cleared": len(result["cleared"]),
+        "missing": len(result["missing"]),
+        "missing_detail": result["missing"][:20],
+    }
 
 
-def interactive(settings: Settings, limit: int = 30) -> dict[str, int]:
-    """Проходит по списку: 1/2/3 выбрать кандидата, n — пропустить, q — выйти."""
-    db = Database(settings.db_path)
-    decided = {"chosen": 0, "skipped": 0}
-    try:
-        rows = [r for r in db.list_review() if _candidates(r)]
-        if not rows:
-            print("Нет позиций с кандидатами — сначала python -m soundbridge match")
-            return decided
-        print("Навигация: 1/2/3 — взять кандидата, n — не переносим, "
-              "回车 — оставить как есть, q — выйти\n")
-        for i, row in enumerate(rows[:limit], start=1):
-            cands = _candidates(row)
-            print(f"[{i}/{min(len(rows), limit)}] {display_track(row['artists'], row['title'], row['version'])}"
-                  f" · {row['album'] or '—'} · {row['duration_ms'] or 0} мс · "
-                  f"в плейлистах: {row['n_refs']}")
-            for j, cand in enumerate(cands[:3], start=1):
-                print(f"  {j}) {cand.get('score', 0):.2f} {cand.get('artists')} — "
-                      f"{cand.get('title')} [{cand.get('album')}] {cand.get('duration_ms')}мс")
-                print(f"     {cand.get('uri')}")
+def run_review(
+    db: Database,
+    limit: int = 0,
+    reader: Callable[[str], str] = input,
+    printer: Callable[[str], None] = print,
+) -> dict[str, Any]:
+    """Интерактивный проход по спорным трекам.
+
+    ``reader``/``printer`` можно подменить в тестах, чтобы не дёргать терминал.
+    """
+    rows = pending(db)
+    if limit and limit > 0:
+        rows = rows[:limit]
+    if not rows:
+        printer("Спорных треков нет — можно переходить к импорту.")
+        return {"seen": 0, "decided": [], "skipped": [], "left": []}
+
+    printer(f"Требуется решений: {len(rows)} (всего спорных {len(pending(db))})")
+    printer(HELP)
+
+    decided: list[str] = []
+    skipped: list[str] = []
+    left: list[str] = []
+    batch: list[tuple[str, str]] = []
+
+    for index, row in enumerate(rows):
+        if len(batch) >= FLUSH_EVERY:
+            _flush(db, batch)
+        _show(row, index, len(rows))
+        while True:
             try:
-                answer = input("> ").strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                print()
+                answer = (reader("решение> ") or "").strip().lower()
+            except EOFError:
+                answer = "q"
+            if answer in {"", "n", "next"}:
+                left.append(row["ym_id"])
                 break
-            if answer in ("q", "quit", "exit"):
+            if answer in {"q", "quit", "exit"}:
+                printer("Останавливаем ревью; несохранённые решения не применяются.")
+                _flush(db, batch)
+                return {"seen": index + 1, "decided": decided, "skipped": skipped,
+                        "left": left + [r["ym_id"] for r in rows[index + 1:]]}
+            if answer in {"?", "h", "help"}:
+                printer(HELP)
+                continue
+            if answer == "d":
+                _show(row, index, len(rows))
+                continue
+            if answer in {"s", "skip"}:
+                batch.append((row["ym_id"], ""))
+                skipped.append(row["ym_id"])
+                printer("  ✓ помечен непереносимым")
                 break
-            if answer == "n":
-                db.set_override(row["ym_id"], "", "отклонено вручную")
-                decided["skipped"] += 1
-                continue
-            if answer in ("1", "2", "3") and len(cands) >= int(answer):
-                uri = cands[int(answer) - 1]["uri"]
-                db.set_override(row["ym_id"], uri, "выбрано вручную")
-                decided["chosen"] += 1
-                print(f"  принято: {uri}")
-                continue
-            print("  пропущено без изменений")
-        db.commit()
-    finally:
-        db.close()
-    if decided["chosen"] or decided["skipped"]:
-        print(f"\nПринято {decided['chosen']}, отклонено {decided['skipped']}. "
-              "Обнови матчинг: python -m soundbridge match")
-    return decided
+            if answer.startswith("m"):
+                rest = answer[1:].strip()
+                try:
+                    value = rest or reader("spotify URI / ссылка / id> ")
+                except EOFError:
+                    value = ""
+                uri = to_uri((value or "").strip())
+                if not uri:
+                    printer("  пусто — ничего не сохраняем, жмём n чтобы пропустить")
+                    continue
+                batch.append((row["ym_id"], uri))
+                decided.append(row["ym_id"])
+                printer(f"  ✓ {uri}")
+                break
+            if answer.isdigit():
+                cands = _candidates(row)
+                num = int(answer)
+                if not (1 <= num <= len(cands)):
+                    printer(f"  нет кандидата №{num} (есть {min(len(cands), 9)})")
+                    continue
+                uri = to_uri(cands[num - 1].get("uri") or "")
+                if not uri:
+                    printer("  у кандидата кривой URI — возьмите другой или вставьте сами")
+                    continue
+                batch.append((row["ym_id"], uri))
+                decided.append(row["ym_id"])
+                printer(f"  ✓ {uri}")
+                break
+            printer("  не понял. ? — справка, q — выйти")
+
+    _flush(db, batch)
+    printer(f"Готово: сохранено {len(decided)}, помечено непереносимыми {len(skipped)},"
+            f" отложено {len(left)}")
+    return {"seen": len(rows), "decided": decided, "skipped": skipped, "left": left}
+
+
+def _flush(db: Database, batch: list[tuple[str, str]]) -> None:
+    if not batch:
+        return
+    apply(db, list(batch))
+    batch.clear()

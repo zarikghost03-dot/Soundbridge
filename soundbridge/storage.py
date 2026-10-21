@@ -754,11 +754,9 @@ class Database:
                 cleared.append(ym_id)
                 continue
             if not self.conn.execute("SELECT 1 FROM sp_track WHERE uri=?", (uri,)).fetchone():
-                missing.append(f"{ym_id} -> {uri} (нет в кэше Spotify, добавим сами)")
-                row = self.track_of_uri(uri)
-                if not row:
-                    continue
-                self.upsert_sp_candidates([row])
+                # вручную вставленный URI может отсутствовать в кэше — заведём
+                # заглушку, снимок или match дополнят метаданные позже
+                self.conn.execute("INSERT OR IGNORE INTO sp_track(uri) VALUES(?)", (uri,))
             self.set_override(ym_id, uri, "ручное решение из ревью")
             self.conn.execute(
                 """INSERT INTO match(ym_id,uri,confidence,method,query,candidates,note,updated_at)
@@ -818,6 +816,19 @@ class Database:
             "SELECT ts, kind, detail FROM event ORDER BY rowid DESC LIMIT ?", (limit,)
         ).fetchall()
 
+    def remember_saved(self, uris: Iterable[str]) -> int:
+        """Дописывает в кэш медиатеки треки, которые мы сохранили сами.
+
+        ``replace_saved`` перезаписывает таблицу целиком и теряет ``added_at``
+        старых строк, а нам нужно лишь добавить новые URI после импорта.
+        """
+        data = [(uri, now(), now()) for uri in dict.fromkeys(uris) if uri]
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO sp_saved(uri,added_at,synced_at) VALUES(?,?,?)", data
+        )
+        self.conn.commit()
+        return len(data)
+
     def mark_playlist_imported(self, ym_kind: str, state: str = "imported") -> None:
         self.conn.execute(
             "UPDATE created_playlist SET state=?, updated_at=? WHERE ym_kind=?",
@@ -859,6 +870,7 @@ class Database:
             "overrides": q("SELECT COUNT(*) FROM override"),
             "spotify_saved": q("SELECT COUNT(*) FROM sp_saved"),
             "spotify_playlists": q("SELECT COUNT(*) FROM sp_playlist"),
+            "sp_tracks": q("SELECT COUNT(*) FROM sp_track"),
             "created_playlists": q("SELECT COUNT(*) FROM created_playlist"),
             "quota_events": q("SELECT COUNT(*) FROM event WHERE kind LIKE 'http_%'"),
         }

@@ -1,313 +1,427 @@
-"""Отчёты: CSV для ручного ревью, план переноса, статус конвейера.
+"""Отчёты Soundbridge: файл ревью, план импорта, сводка состояния.
 
-`out/review.csv` открывается в Excel (UTF-8 BOM). Колонки `decision_uri` и
-`decision_note` пользователь заполняет сам — файл сдаётся обратно командой
-`review --apply`.
+Здесь живёт всё «для глаз»: CSV с несопоставленными треками, markdown-план
+переноса по томам и короткий отчёт о том, на какой стадии проект.
+
+Файлы кладём в :data:`soundbridge.config.OUT_DIR`, состояние берём из SQLite —
+сами отчёты ничего не пишут в Spotify и не портят базу (кроме явного
+``apply_decisions``).
 """
+
 from __future__ import annotations
 
 import csv
 import json
-import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
-from .config import Settings
+from .config import OUT_DIR, Config, ensure_dirs
+from .spotify_client import to_uri
 from .storage import Database
 
-CSV_COLUMNS = [
-    "ym_id",
-    "problem",
-    "artists",
-    "title",
-    "version",
-    "album",
-    "duration_ms",
+REVIEW_CSV = "review.csv"
+PLAN_MD = "plan.md"
+VERIFY_MD = "verify.md"
+
+#: машиночитаемые колонки — их имена совпадают и в CSV, и в чтении решений
+COL_ID = "ym_id"
+COL_DECISION = "decision_uri"
+COL_NOTE = "заметка"
+N_CANDIDATES = 4
+
+#: что человек пишет в ``decision_uri``, если трек переносить не надо
+SKIP_TOKENS = {"-", "--", "skip", "нет", "пропуск"}
+
+_REVIEW_HEADER = [
+    COL_ID,
+    "трек",
+    "исполнитель",
+    "альбом",
+    "длительность",
     "isrc",
-    "times_used",
-    "method",
-    "confidence",
-    "current_uri",
-    "spotify_artist",
-    "spotify_title",
-    "spotify_album",
-    "spotify_duration_ms",
-    "candidate_1",
-    "candidate_2",
-    "candidate_3",
-    "note",
-    "decision_uri",
-    "decision_note",
+    "в_плейлистах",
+    "метод",
+    "уверенность",
+    "почему_сомнительно",
+    COL_DECISION,
+    COL_NOTE,
+    *[f"кандидат_{i + 1}" for i in range(N_CANDIDATES)],
 ]
 
-PROBLEM_LABELS = {
-    "no_result": "не найдено",
-    "review": "сомнительно",
-    "fuzzy": "проверить (нечёткое совпадение)",
-    None: "не сопоставлен",
-}
+
+def review_path(cfg: Config | None = None) -> Path:
+    """Кладёт CSV в ``out/`` и поднимает ошибку, если решение уже лежит в другом месте."""
+    ensure_dirs()
+    return OUT_DIR / REVIEW_CSV
 
 
-def review_file(settings: Settings) -> Path:
-    return settings.root / "out" / "review.csv"
+def plan_path(cfg: Config | None = None) -> Path:
+    ensure_dirs()
+    return OUT_DIR / PLAN_MD
 
 
-def plan_file(settings: Settings) -> Path:
-    return settings.root / "out" / "plan.md"
+def verify_path(cfg: Config | None = None) -> Path:
+    ensure_dirs()
+    return OUT_DIR / VERIFY_MD
 
 
-def _cand_text(row: sqlite3.Row, index: int) -> str:
-    try:
-        cands = json.loads(row["candidates"] or "[]")
-    except ValueError:
+# --------------------------------------------------------------------------- #
+# мелочи форматирования
+# --------------------------------------------------------------------------- #
+
+
+def _artists_of(raw: Any) -> str:
+    """В ``ym_track.artists`` и ``sp_track.artists`` лежит JSON-список."""
+    if raw is None:
         return ""
-    if index >= len(cands):
+    if isinstance(raw, (list, tuple)):
+        return ", ".join(str(a) for a in raw if a)
+    text = str(raw)
+    if not text:
         return ""
-    c = cands[index]
-    return "{} | {} — {} | {} мс | score {}".format(
-        c.get("uri", ""), c.get("artists", ""), c.get("title", ""),
-        c.get("duration_ms", ""), round(float(c.get("score", 0) or 0), 3),
-    )
-
-
-def write_review(settings: Settings, limit: int = 0) -> dict[str, Any]:
-    """Выгружает всё, что требует решения человека."""
-    db = Database(settings.db_path)
     try:
-        rows = db.list_review()
-        out = review_file(settings)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        shown = rows[:limit] if limit else rows
-        with out.open("w", encoding="utf-8-sig", newline="") as fh:
-            writer = csv.writer(fh, quoting=csv.QUOTE_MINIMAL)
-            writer.writerow(CSV_COLUMNS)
-            for row in shown:
-                problem = PROBLEM_LABELS.get(row["method"], row["method"] or "?")
-                writer.writerow([
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return text
+    if isinstance(data, list):
+        return ", ".join(str(a) for a in data if a)
+    return text
+
+
+def _mmss(ms: Any) -> str:
+    try:
+        total = int(ms or 0) // 1000
+    except (TypeError, ValueError):
+        return ""
+    if total <= 0:
+        return ""
+    return f"{total // 60}:{total % 60:02d}"
+
+
+def _candidates_of(row: Any) -> list[dict[str, Any]]:
+    raw = row["candidates"] if "candidates" in row.keys() else None
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return []
+    if isinstance(data, dict):
+        data = data.get("candidates") or []
+    return [c for c in data if isinstance(c, dict)]
+
+
+def _candidate_text(cand: dict[str, Any]) -> str:
+    uri = cand.get("uri") or ""
+    name = cand.get("name") or cand.get("title") or ""
+    artists = _artists_of(cand.get("artists"))
+    album = cand.get("album") or ""
+    score = cand.get("score") or cand.get("confidence")
+    bits = [uri]
+    if name:
+        bits.append(f"{name} — {artists}" if artists else name)
+    if album:
+        bits.append(album)
+    length = _mmss(cand.get("duration_ms"))
+    if length:
+        bits.append(length)
+    if score:
+        try:
+            bits.append(f"{float(score):.2f}")
+        except (TypeError, ValueError):
+            pass
+    return " | ".join(bits)
+
+
+def _why(row: Any) -> str:
+    """Короткое объяснение, почему трек попал в ревью."""
+    method = (row["method"] if "method" in row.keys() else None) or "нет решения"
+    note = (row["note"] if "note" in row.keys() else "") or ""
+    if method == "no_result":
+        return note or "поиск не дал результатов"
+    if method == "review":
+        return note or "слишком низкая уверенность"
+    if method == "fuzzy":
+        score = row["confidence"] if "confidence" in row.keys() else 0
+        return f"нечёткое совпадение (score {float(score or 0):.2f}) — проверить"
+    return note or "не сопоставлен"
+
+
+# --------------------------------------------------------------------------- #
+# CSV ревью
+# --------------------------------------------------------------------------- #
+
+
+def write_review(db: Database, limit: int = 0, path: Path | None = None) -> dict[str, Any]:
+    """Выгружает всё спорное в CSV, который человек правит руками.
+
+    В ``decision_uri`` нужно вписать ``spotify:track:...``, ссылку
+    ``open.spotify.com`` или голый id; пустая строка = «не переносим».
+    """
+    rows = db.list_review()
+    out = Path(path) if path else review_path()
+    total = len(rows)
+    if limit and limit > 0:
+        rows = rows[:limit]
+
+    with out.open("w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(_REVIEW_HEADER)
+        for row in rows:
+            cands = _candidates_of(row)
+            for i in range(len(cands), N_CANDIDATES):
+                cands.append({})
+            writer.writerow(
+                [
                     row["ym_id"],
-                    problem,
-                    row["artists"],
-                    row["title"],
-                    row["version"] or "",
+                    row["title"] or "",
+                    _artists_of(row["artists"]),
                     row["album"] or "",
-                    row["duration_ms"] or 0,
+                    _mmss(row["duration_ms"]),
                     row["isrc"] or "",
-                    row["n_refs"] or 0,
-                    row["method"] or "none",
-                    round(float(row["confidence"] or 0), 3),
-                    row["current_uri"] or row["uri"] or "",
-                    row["sp_artists"] or "",
-                    row["sp_name"] or "",
-                    row["sp_album"] or "",
-                    row["sp_duration_ms"] or "",
-                    _cand_text(row, 0),
-                    _cand_text(row, 1),
-                    _cand_text(row, 2),
-                    row["note"] or "",
+                    row["n_refs"] if "n_refs" in row.keys() else "",
+                    (row["method"] if "method" in row.keys() else "") or "нет решения",
+                    f"{float(row['confidence'] or 0):.2f}" if row["confidence"] is not None else "",
+                    _why(row),
+                    "",  # сюда человек вписывает решение
                     "",
-                    "",
-                ])
-        counts = db.review_counts()
-        refs_pending = sum(int(r["n_refs"] or 0) for r in rows)
-        return {"path": str(out), "rows": len(shown), "total": len(rows),
-                "counts": counts, "refs_pending": refs_pending}
-    finally:
-        db.close()
-
-
-def _read_csv(path: Path) -> list[dict[str, str]]:
-    with path.open("r", encoding="utf-8-sig", newline="") as fh:
-        reader = csv.DictReader(fh)
-        if not reader.fieldnames:
-            raise SystemExit(f"{path}: пустой файл (нет строки заголовков)")
-        missing = [c for c in ("ym_id", "decision_uri") if c not in reader.fieldnames]
-        if missing:
-            raise SystemExit(
-                f"{path}: нет колонок {missing}. Возьми свежий out/review.csv из команды `review`"
+                    *[_candidate_text(c) for c in cands[:N_CANDIDATES]],
+                ]
             )
+
+    counts = db.review_counts()
+    db.log_event("review", f"выгружено {len(rows)} из {total} спорных -> {out.name}")
+    return {
+        "path": str(out),
+        "written": len(rows),
+        "total_review": total,
+        "review": counts.get("review", 0),
+        "no_result": counts.get("no_result", 0),
+        "uncertain": counts.get("uncertain", 0),
+        "untouched": counts.get("untouched", 0),
+    }
+
+
+def read_review(path: Path) -> list[dict[str, str]]:
+    """Читает CSV ревью в списке dict-строк (BOM уже снят)."""
+    with Path(path).open("r", newline="", encoding="utf-8-sig") as fh:
+        reader = csv.DictReader(fh)
+        if not reader.fieldnames or COL_ID not in reader.fieldnames:
+            raise ValueError(f"в {path} нет колонки {COL_ID} — это не файл ревью Soundbridge")
         return [dict(r) for r in reader]
 
 
-def apply_decisions(settings: Settings, path: Path | None = None,
-                    dry_run: bool = False) -> dict[str, Any]:
-    """Читает заполненный review.csv и переносит решения в таблицу `override`.
+def collect_decisions(rows: Iterable[dict[str, str]]) -> list[tuple[str, str]]:
+    """Достаёт из строк CSV пары ``(ym_id, uri)`` для заполненных решений.
 
-    `decision_uri` пустой → помечаем «не переносим» (снимает запись из match,
-    чтобы импорт не подтянул старый ненадёжный вариант).
+    Пустая ячейка — «ничего не менять»; чтобы пометить трек непереносимым,
+    впишите в ``decision_uri`` любой из маркеров: ``-``, ``skip``, ``нет``.
     """
-    source = Path(path) if path else review_file(settings)
+    decisions: list[tuple[str, str]] = []
+    for row in rows:
+        ym_id = (row.get(COL_ID) or "").strip()
+        if not ym_id:
+            continue
+        raw = (row.get(COL_DECISION) or "").strip()
+        if not raw or raw.lower() in SKIP_TOKENS:
+            continue
+        decisions.append((ym_id, to_uri(raw)))
+    return decisions
+
+
+def apply_decisions(
+    db: Database,
+    path: Path | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Забирает ручные решения из CSV в базу (таблица ``override`` + ``match``).
+
+    После этого достаточно перезапустить матчинг/импорт: решения ручной работы
+    имеют наивысший приоритет и больше не перезаписываются.
+    """
+    source = Path(path) if path else review_path()
     if not source.exists():
-        raise SystemExit(f"{source} не найден. Сначала выполни: python -m soundbridge review")
+        raise FileNotFoundError(f"нет файла ревью: {source}. Сначала выполните `review`.")
 
-    db = Database(settings.db_path)
-    try:
-        known = {r["ym_id"] for r in db.conn.execute("SELECT ym_id FROM ym_track")}
-        filled: list[tuple[str, str]] = []
-        skipped: list[tuple[str, str]] = []
-        for row in _read_csv(source):
-            ym_id = (row.get("ym_id") or "").strip()
-            if not ym_id:
-                continue
-            if ym_id not in known:
-                skipped.append((ym_id, "нет такого трека в базе"))
-                continue
-            uri = (row.get("decision_uri") or "").strip()
-            note = (row.get("decision_note") or "").strip()
-            if uri and not uri.startswith("spotify:track:"):
-                skipped.append((ym_id, f"неверный формат uri: {uri}"))
-                continue
-            filled.append((ym_id, uri, note))
+    rows = read_review(source)
+    decisions = collect_decisions(rows)
+    skipped = [
+        (r[COL_ID].strip(), "")
+        for r in rows
+        if (r.get(COL_ID) or "").strip() and (r.get(COL_DECISION) or "").strip().lower() in {"-", "--", "skip", "нет", "пропуск"}
+    ]
+    pairs = decisions + skipped
 
-        if dry_run:
-            return {"would_apply": len(filled), "skipped": len(skipped), "dry_run": True,
-                    "sample": filled[:10], "errors": skipped[:10]}
+    if dry_run:
+        return {"path": str(source), "dry_run": True, "would_apply": len(decisions), "would_skip": len(skipped)}
+    if not pairs:
+        return {"path": str(source), "dry_run": False, "applied": 0, "skipped": 0, "missing": 0}
 
-        result = db.apply_overrides([(x[0], x[1]) for x in filled])
-        for ym_id, _uri, note in filled:
-            if note:
-                db.conn.execute(
-                    "UPDATE override SET note=? WHERE ym_id=?", (note, ym_id)
-                )
-        db.commit()
-        result["skipped"] = len(skipped)
-        result["errors"] = skipped[:20]
-        db.log_event("review_applied", result)
-        return result
-    finally:
-        db.close()
+    result = db.apply_overrides(pairs)
+    db.log_event(
+        "review",
+        f"принято ручных решений: {len(result['applied'])}, помечено непереносимыми: {len(result['cleared'])}",
+    )
+    return {
+        "path": str(source),
+        "dry_run": False,
+        "applied": len(result["applied"]),
+        "skipped": len(result["cleared"]),
+        "missing": len(result["missing"]),
+        "missing_detail": result["missing"][:20],
+    }
 
 
-def write_plan(settings: Settings) -> dict[str, Any]:
-    """План переноса в Markdown: объёмы, плейлисты, риски."""
-    db = Database(settings.db_path)
-    try:
-        counts = db.counts()
-        resolved = db.resolved()
-        methods = db.method_breakdown()
-        playlists = db.playlists()
-        vols = _volumes(db, settings)
+# --------------------------------------------------------------------------- #
+# план импорта
+# --------------------------------------------------------------------------- #
 
-        lines: list[str] = []
-        lines.append("# План переноса Яндекса в Spotify\n")
-        lines.append(f"Треков в библиотеке Яндекса: **{counts.get('ym_tracks', 0)}**")
-        lines.append(f"Сопоставлено (будет перенесено): **{len(resolved)}**")
-        lines.append(f"Ждут ревью: **{sum(methods.get(k, 0) for k in ('review', 'no_result'))}")
+
+def planned_volumes(db: Database, cfg: Config) -> dict[str, int]:
+    """Сколько тонов Spotify потребуется на каждый плейлист (лимит 10 000)."""
+    per_volume = max(1, min(cfg.import_.max_playlist_tracks, cfg.limits.playlist_max_tracks))
+    resolved = db.resolved()
+    out: dict[str, int] = {}
+    for pl in db.playlists():
+        ids = db.playlist_items(pl["kind"])
+        have = sum(1 for ym in ids if ym in resolved)
+        out[pl["kind"]] = max(1, -(-have // per_volume)) if have else 0
+    return out
+
+
+def write_plan(db: Database, cfg: Config, path: Path | None = None) -> dict[str, Any]:
+    """Markdown-план: что именно и в каком виде поедет в Spotify."""
+    ensure_dirs()
+    out = Path(path) if path else plan_path()
+    counts = db.counts()
+    resolved = db.resolved()
+    per_volume = max(1, min(cfg.import_.max_playlist_tracks, cfg.limits.playlist_max_tracks))
+    saved_now = counts.get("spotify_saved", 0)
+
+    lines: list[str] = ["# План переноса", ""]
+    lines += [
+        f"- треков в Яндексе: **{counts['ym_tracks']}** (с ISRC {counts['ym_tracks_with_isrc']})",
+        f"- решений матчинга: **{counts['matched']}** из них автоматически "
+        f"(isrc {counts['match_isrc']}, точных {counts['match_exact']}, нечётких {counts['match_fuzzy']})",
+        f"- требует ревью: **{counts['match_review']}**, без результата: **{counts['match_none']}**",
+        f"- уже в медиатеке Spotify: **{saved_now}** (свободно мест: "
+        f"{max(0, cfg.limits.library_max_tracks - saved_now)})",
+        f"- лимит треков в одном плейлисте Spotify: **{per_volume}**",
+        "",
+        "## Плейлисты",
+        "",
+        "| Плейлист | Треков | Переносим | Тонов | Пропусков |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+
+    volumes_total = 0
+    for pl in db.playlists():
+        ids = db.playlist_items(pl["kind"])
+        have = sum(1 for ym in ids if ym in resolved)
+        vols = max(1, -(-have // per_volume)) if have else 0
+        volumes_total += vols
+        title = pl["title"] or pl["kind"]
+        if pl["is_likes"]:
+            title = f"{title} → «{cfg.import_.likes_playlist_title}»"
+        lines.append(f"| {title} | {len(ids)} | {have} | {vols} | {len(ids) - have} |")
+
+    lines += [
+        "",
+        f"Итого тонов к созданию: **{volumes_total}**",
+        "",
+        "## Режим",
+        "",
+        f"- dry_run: `{cfg.import_.dry_run}` (сменить: `--apply` или `import_.dry_run = false` в config.toml)",
+        f"- создавать плейлисты: `{cfg.import_.create_playlists}`",
+        f"- переносить лайки в медиатеку: `{cfg.import_.import_likes}`",
+    ]
+    if cfg.import_.skip_playlists:
+        lines.append(f"- исключаемые плейлисты: {', '.join(cfg.import_.skip_playlists)}")
+    if cfg.import_.only_playlists:
+        lines.append(f"- только эти плейлисты: {', '.join(cfg.import_.only_playlists)}")
+    if cfg.import_.prefix:
+        lines.append(f"- префикс имени: `{cfg.import_.prefix}`")
+
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    db.log_event("plan", f"tonov={volumes_total}")
+    return {"path": str(out), "volumes": volumes_total, "per_volume": per_volume}
+
+
+# --------------------------------------------------------------------------- #
+# статус
+# --------------------------------------------------------------------------- #
+
+
+def status(db: Database, cfg: Config | None = None) -> dict[str, Any]:
+    """Одна структура со всем текущим состоянием конвейера."""
+    counts = db.counts()
+    review = db.review_counts()
+    methods = {row["method"]: row["n"] for row in db.method_breakdown()}
+    created = [dict(row) for row in db.created()]
+    events = [dict(row) for row in db.logs(12)]
+    stages: dict[str, str] = {}
+    stages["auth"] = "ok" if db.get_meta("sp_uid") else "нет Spotify-профиля"
+    stages["export"] = "ok" if counts["ym_tracks"] else "пусто"
+    stages["snapshot"] = "ok" if counts["spotify_saved"] else "нет снимка Spotify"
+    if counts["matched"]:
+        stages["match"] = "ok"
+    elif counts["ym_tracks"]:
+        stages["match"] = "не запущен"
+    else:
+        stages["match"] = "нужен экспорт"
+    if counts["created_playlists"]:
+        stages["import"] = "ok"
+    elif counts["matched"]:
+        stages["import"] = "не запущен"
+    else:
+        stages["import"] = "нужен match"
+    return {
+        "counts": counts,
+        "review": review,
+        "methods": methods,
+        "created": created,
+        "events": events,
+        "stages": stages,
+        "config": {
+            "dry_run": cfg.import_.dry_run if cfg else None,
+            "playlist_max_tracks": cfg.limits.playlist_max_tracks if cfg else None,
+            "library_max_tracks": cfg.limits.library_max_tracks if cfg else None,
+        },
+    }
+
+
+def format_status(data: dict[str, Any]) -> str:
+    """Текстовая сводка для консоли."""
+    counts = data["counts"]
+    review = data["review"]
+    lines = [
+        "Состояние базы",
+        "---------------",
+        f"Яндекс:     треков {counts['ym_tracks']} (ISRC {counts['ym_tracks_with_isrc']}), "
+        f"плейлистов {counts['ym_playlists']}"
+        + (f", пропущено автосгенерированных {counts['ym_playlists_skipped']}" if counts["ym_playlists_skipped"] else ""),
+        f"Матчинг:    решено {counts['matched']} · isrc {counts['match_isrc']} · "
+        f"точных {counts['match_exact']} · нечётких {counts['match_fuzzy']} · "
+        f"ревью {counts['match_review']} · нет результата {counts['match_none']}",
+        f"Ручныеправки: {counts['overrides']} · ревью к работе: {review.get('review', 0) + review.get('no_result', 0)}",
+        f"Spotify:    в медиатеке {counts['spotify_saved']}, плейлистов {counts['spotify_playlists']}, "
+        f"создано нами {counts['created_playlists']}",
+        "",
+        "Стадии:",
+    ]
+    for name, state in data["stages"].items():
+        mark = "✓" if state == "ok" else "·"
+        lines.append(f"  {mark} {name}: {state}")
+    if data["created"]:
         lines.append("")
-        lines.append("## Как найдены соответствия")
-        for method, n in sorted(methods.items(), key=lambda kv: -kv[1]):
-            lines.append(f"- `{method}`: {n}")
+        lines.append("Созданные плейлисты:")
+        for row in data["created"]:
+            lines.append(
+                f"  - {row['name']} [{row['state']}] {row['added']}/{row['planned']} · {row['sp_uri'] or row['sp_id']}"
+            )
+    if data["events"]:
         lines.append("")
-        lines.append("## Что создадим в Spotify")
-        lines.append("")
-        lines.append("| Источник (Яндекс) | Треков | Переносим | volumes |")
-        lines.append("| --- | --- | --- | --- |")
-        by_pl: dict[str, int] = {}
-        for r in db.conn.execute(
-            "SELECT pt.playlist_id, COUNT(*) AS n FROM playlist_track pt "
-            "JOIN ym_track t ON t.ym_id = pt.ym_id GROUP BY pt.playlist_id"
-        ):
-            by_pl[r["playlist_id"]] = int(r["n"])
-        res_ids = set(resolved.keys())
-        for pl in playlists:
-            items = db.playlist_items(pl["kind"]) if pl["kind"] == "likes" else None
-            if items is None:
-                ids = [r["ym_id"] for r in db.conn.execute(
-                    "SELECT ym_id FROM playlist_track WHERE playlist_id=? ORDER BY ord",
-                    (pl["id"],))]
-            else:
-                ids = []
-                for uri in items:
-                    row = db.track_of_uri(uri)
-                    ids.append(row["ym_id"] if row else "")
-            hit = sum(1 for i in ids if i in res_ids)
-            n_vol = vols.get(pl["kind"], 1)
-            lines.append(f"| {pl['kind']}: {pl['title']} | {len(ids)} | {hit} | {n_vol} |")
-        lines.append("")
-        lines.append(f"Плейлистов в Spotify будет создано: **{sum(vols.values())}**")
-        lines.append("")
-        lines.append("## Риски")
-        lines.append("- Лимит Spotify — 10 000 треков в плейлисте, поэтому большие "
-                      "плейлисты нарезаются на части.")
-        lines.append("- Яндекс-коллабы и UGC-релизы часто отсутствуют в Spotify: "
-                      "соответствующая доля треков останется в `no_result`.")
-        lines.append("- Проверь `out/review.csv` перед `import --apply`.")
-        path = plan_file(settings)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return {"path": str(path), "resolved": len(resolved), "counts": counts}
-    finally:
-        db.close()
-
-
-def _volumes(db: Database, settings: Settings) -> dict[str, int]:
-    """Сколько плейлистов-частей понадобится на каждый источник."""
-    import math
-
-    from .importer import planned_volumes
-
-    return planned_volumes(db, settings)
-
-
-def status(settings: Settings) -> dict[str, Any]:
-    """Сводка по стадиям конвейера — для `cli status`."""
-    db = Database(settings.db_path)
-    try:
-        stages: dict[str, Any] = {}
-        for row in db.conn.execute("SELECT job, state, updated_at FROM job"):
-            try:
-                parsed = json.loads(row["state"])
-            except ValueError:
-                parsed = {}
-            stages[row["job"]] = {"state": parsed, "updated_at": row["updated_at"]}
-
-        def done(job: str) -> bool:
-            return bool(stages.get(job, {}).get("state", {}).get("done"))
-
-        return {
-            "counts": db.counts(),
-            "methods": db.method_breakdown(),
-            "review": db.review_counts(),
-            "stages": stages,
-            "stages_done": {
-                "export": done("export"),
-                "snapshot": done("snapshot"),
-                "match": done("match"),
-                "import": done("import"),
-            },
-            "meta": {
-                "sp_snapshot_at": db.get_meta("sp_snapshot_at"),
-                "sp_liked_total": db.get_meta_int("sp_liked_total"),
-                "likes_revision": db.get_meta_int("ym_likes_revision"),
-                "overrides": db.count_overrides(),
-                "overrides_pending": len(db.pending_overrides()),
-            },
-            "logs": [
-                {"at": r["created_at"], "kind": r["kind"], "state": r["state"]}
-                for r in db.logs(12)
-            ],
-        }
-    finally:
-        db.close()
-
-
-def format_status(settings: Settings) -> str:
-    data = status(settings)
-    out = ["— Состояние —"]
-    out.append("  База: " + ", ".join(f"{k}={v}" for k, v in data["counts"].items()))
-    out.append("  Методы: " + (", ".join(f"{k}={v}" for k, v in
-                                        sorted(data["methods"].items(), key=lambda kv: -kv[1])) or "—"))
-    rv = data["review"]
-    out.append(f"  Ревью: всего {rv.get('total', 0)} "
-               f"(не найдено {rv.get('no_result', 0)}, сомнительно {rv.get('review', 0)}, "
-               f"fuzzy {rv.get('fuzzy', 0)})")
-    out.append("  Стадии: " + ", ".join(f"{k}={'✓' if v else '—'}" for k, v in
-                                       data["stages_done"].items()))
-    meta = data["meta"]
-    out.append(f"  Снимок Spotify: {meta['sp_snapshot_at'] or 'нет'}, "
-               f"лайков в Spotify: {meta['sp_liked_total']}, "
-               f"override: {meta['overrides']} (применено ждёт {meta['overrides_pending']})")
-    if data["logs"]:
-        out.append("  Последние события:")
-        for row in data["logs"]:
-            out.append(f"    {row['at']}  {row['kind']}  {row['state']}")
-    return "\n".join(out)
+        lines.append("Последние события:")
+        for ev in data["events"][:8]:
+            lines.append(f"  {ev['ts']} {ev['kind']}: {ev['detail']}")
+    return "\n".join(lines)

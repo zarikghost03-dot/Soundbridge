@@ -85,6 +85,8 @@ class Snapshot:
         if with_playlists:
             stats["playlists"] = self.playlists(progress)
         indexed = self.store.reindex_tracks()
-        stats["sp_tracks"] = indexed.get("sp_tracks", 0) if isinstance(indexed, dict) else 0
+        counts = self.store.counts()
+        stats["ym_indexed"] = indexed.get("ym_tracks", 0) if isinstance(indexed, dict) else 0
+        stats["sp_tracks"] = counts.get("sp_tracks", 0)
         self.store.log_event("snapshot", f"saved={stats['saved']} playlists={stats['playlists']}")
         return stats

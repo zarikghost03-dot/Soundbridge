@@ -628,8 +628,21 @@ def uri_id(uri: str) -> str:
 
 
 def to_uri(track_id_or_uri: str) -> str:
-    if not track_id_or_uri:
+    """Приводит аргумент к spotify-URI трека.
+
+    Принимает: ``spotify:track:ID``, голый ``ID`` или ссылку вида
+    ``https://open.spotify.com/track/ID?si=...`` (как её отдаёт веб-плеер).
+    """
+    value = (track_id_or_uri or "").strip()
+    if not value:
         return ""
-    if track_id_or_uri.startswith("spotify:"):
-        return track_id_or_uri
-    return f"spotify:track:{track_id_or_uri}"
+    if value.startswith("spotify:"):
+        return value
+    if "open.spotify.com" in value or value.startswith("http"):
+        parts = [p for p in urlparse(value).path.split("/") if p]
+        if len(parts) >= 2 and parts[-2] in {"track", "episode", "album"}:
+            return f"spotify:{parts[-2]}:{parts[-1]}"
+        if parts:
+            return f"spotify:track:{parts[-1]}"
+        return ""
+    return f"spotify:track:{value}"
