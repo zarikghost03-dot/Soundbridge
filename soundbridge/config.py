@@ -37,6 +37,9 @@ class YandexCfg:
 class SpotifyCfg:
     client_id: str = ""
     redirect_uri: str = "http://127.0.0.1:8899/callback"
+    #: HTTP/SOCKS-туннель до Spotify (например http://127.0.0.1:1080 или
+    #: socks5://127.0.0.1:7890). Нужен, пока Spotify режет RU-IP на API.
+    proxy: str = ""
     scopes: list[str] = field(default_factory=lambda: [
         "playlist-read-private",
         "playlist-read-collaborative",
@@ -45,7 +48,7 @@ class SpotifyCfg:
         "user-library-read",
         "user-library-modify",
         "user-read-email",
-        "user-private",
+        "user-read-private",
     ])
 
 

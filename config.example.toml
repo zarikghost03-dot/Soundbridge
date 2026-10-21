@@ -1,4 +1,4 @@
-# Копируем в config.toml и правим под себя.
+﻿# Копируем в config.toml и правим под себя.
 # Всё остальное можно оставить по умолчанию.
 
 [spotify]
@@ -6,6 +6,8 @@
 client_id = ""
 # Должно совпадать с Redirect URI в приложении символ в символ
 redirect_uri = "http://127.0.0.1:8899/callback"
+# Туннель до Spotify: http://127.0.0.1:1080 или socks5://127.0.0.1:7890 (пусто = напрямую)
+proxy = ""
 
 [import_]
 # Пока true — ничего не записываем, только считаем и пишем план.
@@ -65,3 +67,4 @@ checkpoint_every = 200
 [yandex]
 device_poll_seconds = 5
 request_delay_ms = 250
+

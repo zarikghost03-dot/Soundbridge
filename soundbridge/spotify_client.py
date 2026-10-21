@@ -27,6 +27,13 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 
+try:  # системное хранилище сертификатов: спасает от MITM-перехвата провайдера
+    import truststore
+
+    truststore.inject_into_ssl()
+except ImportError:  # pragma: no cover - опциональная зависимость
+    pass
+
 from .config import SPOTIFY_TOKEN_CACHE, Config, read_token_cache, require_client_id, write_token_cache
 
 ACCOUNTS = "https://accounts.spotify.com"
@@ -142,6 +149,24 @@ def _wait_for_code(cfg: Config, timeout: float = 300.0) -> dict[str, str]:
     return _Callback.result
 
 
+def _proxies(cfg: Config | None = None) -> dict[str, str] | None:
+    """Прокси до Spotify: из config.toml ([spotify] proxy) или SPOTIFY_PROXY.
+
+    Актуально, пока Spotify отвечает 403 «unavailable in this country» на
+    запросы с RU-адресов: трафик программы можно пустить в тот же туннель,
+    которым вы пользуетесь для прослушивания (http, https или socks5).
+    """
+    proxy = ""
+    if cfg is not None:
+        proxy = (cfg.spotify.proxy or "").strip()
+    proxy = proxy or os.environ.get("SPOTIFY_PROXY", "").strip()
+    if not proxy:
+        return None
+    if "://" not in proxy:
+        proxy = "http://" + proxy
+    return {"http": proxy, "https": proxy}
+
+
 def _exchange(cfg: Config, code: str, verifier: str) -> dict[str, Any]:
     response = requests.post(
         f"{ACCOUNTS}/api/token",
@@ -153,6 +178,7 @@ def _exchange(cfg: Config, code: str, verifier: str) -> dict[str, Any]:
             "code_verifier": verifier,
         },
         timeout=30,
+        proxies=_proxies(cfg),
     )
     if response.status_code != 200:
         raise SpotifyError(
@@ -197,7 +223,7 @@ class TokenBundle:
         write_token_cache(SPOTIFY_TOKEN_CACHE, self.__dict__)
 
 
-def refresh_tokens(bundle: TokenBundle, client_id: str) -> TokenBundle:
+def refresh_tokens(bundle: TokenBundle, client_id: str, cfg: Config | None = None) -> TokenBundle:
     if not bundle.refresh_token:
         raise SpotifyError("refresh-токена нет — нужна повторная авторизация", 400)
     response = requests.post(
@@ -208,6 +234,7 @@ def refresh_tokens(bundle: TokenBundle, client_id: str) -> TokenBundle:
             "client_id": client_id,
         },
         timeout=30,
+        proxies=_proxies(cfg),
     )
     if response.status_code != 200:
         raise SpotifyError(
@@ -321,6 +348,9 @@ class SpotifyAccount:
         self.bundle = bundle
         self.quota = Quota()
         self.http = requests.Session()
+        proxies = _proxies(cfg)
+        if proxies:
+            self.http.proxies.update(proxies)
         self.user_id = bundle.user_id
         self.product = ""
 

@@ -129,7 +129,7 @@ def device_login(cfg: Config, on_code: Callable[[str, str], None] | None = None)
         if on_code:
             on_code(code.user_code, code.verification_url)
         else:  # pragma: no cover - CLI всегда передаёт коллбек
-            print(f"Подтвердите доступ: {code.verification_url}\nКод: {code.user_code}")
+            print(f"Подтвердите доступ: {code.verification_url}\nКод: {code.user_code}", flush=True)
 
     try:
         token = client.device_auth(
@@ -200,9 +200,15 @@ class YandexAccount:
             ) from exc
         except (NetworkError, TimedOutError) as exc:  # pragma: no cover - сеть
             raise YandexError(f"нет связи с Яндекс.Музыкой: {exc}") from exc
-        self.uid = int(getattr(status, "uid", 0) or self.bundle.uid or 0)
-        self.login = getattr(status, "login", "") or self.bundle.login
-        can_premium = bool(getattr(status, "premium", False))
+        account = getattr(status, "account", None) or status
+        self.uid = int(getattr(account, "uid", 0) or self.bundle.uid or 0)
+        self.login = getattr(account, "login", "") or self.bundle.login
+        subscription = getattr(status, "subscription", None)
+        can_premium = bool(
+            getattr(status, "premium", False)
+            or getattr(subscription, "has_plus", False)
+            or getattr(getattr(status, "plus", None), "has_plus", False)
+        )
         self.bundle.uid, self.bundle.login = self.uid, self.login
         self.bundle.save()
         self.premium = can_premium

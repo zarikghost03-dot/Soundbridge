@@ -63,7 +63,18 @@ def _db() -> Database:
 
 
 def _connect_yandex(cfg: Config, args: argparse.Namespace) -> YandexAccount:
-    return YandexAccount.connect(cfg, force_login=getattr(args, "relogin", False))
+    def _show_code(code: str, url: str) -> None:
+        PROGRESS(f"Откройте страницу Яндекса и подтвердите доступ. Код: {code}")
+        PROGRESS(f"    {url}")
+        try:
+            import webbrowser
+
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    return YandexAccount.connect(cfg, force_login=getattr(args, "relogin", False),
+                                 on_code=_show_code)
 
 
 def _connect_spotify(cfg: Config, args: argparse.Namespace) -> SpotifyAccount:
