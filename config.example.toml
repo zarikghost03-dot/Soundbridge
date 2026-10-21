@@ -1,0 +1,67 @@
+# Копируем в config.toml и правим под себя.
+# Всё остальное можно оставить по умолчанию.
+
+[spotify]
+# Client ID из https://developer.spotify.com/dashboard (можно и через .env)
+client_id = ""
+# Должно совпадать с Redirect URI в приложении символ в символ
+redirect_uri = "http://127.0.0.1:8899/callback"
+
+[import_]
+# Пока true — ничего не записываем, только считаем и пишем план.
+# Переключить на false, когда проверите out/plan.md
+dry_run = true
+# Лайки Яндекса отдельным плейлистом (в «Мне нравится» Spotify их не загнать)
+likes_playlist = true
+likes_playlist_title = "Мне нравится (перенос из Яндекса)"
+# Лайки можно и не переносить
+import_likes = true
+create_playlists = true
+# Не переносить плейлисты с такими заголовками
+skip_playlists = []
+# Перенести только эти (по названию или kind), пусто = все
+only_playlists = []
+# Приставка к названию новых плейлистов
+prefix = ""
+# Сколько треков максимум в один плейлист, выше 10000 Spotify не даст
+max_playlist_tracks = 10000
+
+[limits]
+# Жёсткие лимиты Spotify, менять смысла нет
+playlist_max_tracks = 10000
+library_max_tracks = 10000
+batch_write = 100
+batch_add = 100
+
+[match]
+# >= auto_score переносим молча, < review_score помечаем как «не найдено»,
+# между ними — в ручное ревью. Пороги можно менять и пересобирать матчинг
+# без новых запросов к Spotify: кандидаты уже лежат в базе.
+auto_score = 0.90
+review_score = 0.72
+# Разница длительности, при которой совпадение ещё возможно
+duration_tolerance_ms = 2500
+duration_hard_ms = 12000
+# Веса частей совпадения
+weight_isrc = 1.00
+weight_title = 0.45
+weight_artist = 0.35
+weight_duration = 0.20
+# Штраф, если версия трека не совпала (live/remix и т.п.)
+version_penalty = 0.08
+# Сколько вариантов искать в ответе /search
+search_limit = 10
+
+[throttle]
+# Между запросами к Spotify, мс. 220 — с запасом против rate limit
+request_interval_ms = 220
+burst = 8
+max_retries = 6
+backoff_base_ms = 1000
+backoff_cap_ms = 60000
+# Как часто ставить чекпоинт длинной стадии
+checkpoint_every = 200
+
+[yandex]
+device_poll_seconds = 5
+request_delay_ms = 250

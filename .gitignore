@@ -1,0 +1,18 @@
+# секреты и локальное состояние
+.env
+secrets/
+data/
+out/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# редакторы / ОС
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
