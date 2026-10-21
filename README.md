@@ -168,3 +168,21 @@ $env:PYTHONPATH="."
 профилем), `out/` (отчёты). Токены Яндекса отзываемы
 в <https://id.yandex.ru/security/devices>, Spotify —
 в <https://www.spotify.com/account/apps/>.
+
+### Если провайдер перехватывает TLS (Tattelecom и подобные)
+
+GitHub за таким провайдером отдаёт цепочку, подписанную сертификатом
+провайдера (`CN=Tattelecom.ttc`), с просроченным intermediate — git падает на
+`CRYPT_E_NO_REVOCATION_CHECK` (schannel) или `certificate has expired`
+(openssl). Разовое лечение для пуша из этого репозитория:
+
+```powershell
+git config --local http.schannelCheckRevoke false
+git config --local http.sslVerify false   # ⚠ отключает проверку сертификата
+```
+
+Безопаснее тот же трафик по SSH (перехват TLS на него не действует):
+сгенерируйте ключ (`ssh-keygen -t ed25519`), добавьте публичную часть в
+GitHub → Settings → SSH keys, и переключите remote на
+`git@github.com:<user>/Soundbridge.git`.
+
