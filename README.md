@@ -186,3 +186,24 @@ git config --local http.sslVerify false   # ⚠ отключает провер�
 GitHub → Settings → SSH keys, и переключите remote на
 `git@github.com:<user>/Soundbridge.git`.
 
+### Если Spotify отвечает 403 «Spotify is unavailable in this country»
+
+Spotify официально не работает в РФ и режет Web API по IP. Нужен туннель
+**уровня системы** — VPN-расширение в браузере не подходит: оно проксирует
+только сам браузер, а Python-программа ходит в интернет напрямую.
+
+Самый простой бесплатный способ — Psiphon 3 для Windows
+(официальная страница: <https://s3.amazonaws.com/0ubz-2q11-gi9y/ru.html>):
+
+1. скачать `psiphon3.exe`, запустить, нажать «Подключиться»;
+2. в `.env` раскомментировать строку
+   `SPOTIFY_PROXY=http://127.0.0.1:10809` (это локальный HTTP-прокси Псифона;
+   SOCKS-порт — 10808, для него нужен `pip install pysocks`);
+3. перелогинить Spotify: `.venv\Scripts\python.exe -m soundbridge auth
+   --spotify-only --relogin` (или `scripts/manual_auth.py new/finish`);
+4. убедиться, что перехвата нет: `scripts/check_spotify_tls.py` — issuer
+   должен быть настоящим (DigiCert и т.п.), а не `Tattelecom.ttc`.
+
+Psiphon должен оставаться включённым на время `snapshot` / `match` / `import`
+(можно кусками — чекпоинты в SQLite позволяют продолжить позже).
+
